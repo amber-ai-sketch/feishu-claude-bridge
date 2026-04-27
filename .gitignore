@@ -1,0 +1,9 @@
+node_modules/
+bun.lock
+bun.lockb
+*.log
+.env
+.env.local
+
+# state files (may contain session ids, not secrets but user-local)
+state/

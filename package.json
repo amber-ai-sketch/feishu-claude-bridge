@@ -1,0 +1,21 @@
+{
+  "name": "feishu-claude-bridge",
+  "version": "0.1.0",
+  "description": "Feishu <-> Claude Code CLI bridge (bot-only, single-user, bypass permissions)",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run bridge.ts",
+    "dev": "bun run --watch bridge.ts",
+    "typecheck": "tsc --noEmit",
+    "fake-event": "bun run fake-event.ts"
+  },
+  "dependencies": {
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "@types/node-cron": "^3.0.11",
+    "@types/bun": "latest",
+    "typescript": "^5.6.3"
+  }
+}
