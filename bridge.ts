@@ -119,6 +119,123 @@ function resetInteractiveSession(chatId: string) {
   saveSessions();
 }
 
+// ─── markdown 预处理：表格 → 代码块 ──────────────────────────────────────────
+// 飞书 post 富文本格式 **不支持表格**（CHANGELOG 里也从未出现 table 支持）。
+// lark-cli --markdown 遇到 GFM 表格会把它吞掉或退化成一堆 | 字符的散行。
+// 处理：
+//   1. 把检测到的表格整段用 ``` 代码块包起来 —— 代码块飞书原生支持
+//   2. 按"视觉宽度"（CJK 全角 = 2 cells, ASCII = 1 cell）重新 pad 每格，让等宽字体下列真的对齐
+//   3. 剥掉 **bold** 标记（在代码块里会以字面量显示，徒增噪音）
+// 不处理：已经在 ``` 内的块（避免嵌套）；落在行中的单个 | 字符（不是表格）。
+
+// 视觉宽度计算：East Asian Wide/Fullwidth 记 2 格，其余记 1 格
+// 注意：把 Unicode EAW="Ambiguous" 的常见字符（—、└、┌、●、→ 等）也当作宽字符
+//       处理，因为在中文等宽字体上下文下它们实际就是 2 cells。v8 版本漏了这一层，
+//       带 └ 的子项列右侧 pipe 会往右偏 1 格。
+function visualWidth(s: string): number {
+  let w = 0;
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (
+      (cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
+      (cp >= 0x2010 && cp <= 0x201f) || // general punctuation: —（em-dash）– … 等
+      (cp >= 0x2020 && cp <= 0x205f) || // 更多 general punctuation（†‡•…‰ 等）
+      (cp >= 0x2190 && cp <= 0x21ff) || // Arrows（← → ↑ ↓）
+      (cp >= 0x2200 && cp <= 0x22ff) || // Mathematical Operators（∑ ∏ √ 等）
+      (cp >= 0x2460 && cp <= 0x24ff) || // Enclosed Alphanumerics（① ② …）
+      (cp >= 0x2500 && cp <= 0x257f) || // Box Drawing（└ ─ │ ├ ┌ 等）
+      (cp >= 0x2580 && cp <= 0x259f) || // Block Elements
+      (cp >= 0x25a0 && cp <= 0x25ff) || // Geometric Shapes（● ○ ■ □）
+      (cp >= 0x2600 && cp <= 0x26ff) || // Miscellaneous Symbols（☀ ☂ ✓）
+      (cp >= 0x2700 && cp <= 0x27bf) || // Dingbats（✔ ✗ ✈）
+      (cp >= 0x2e80 && cp <= 0x9fff) || // CJK radicals / Kangxi / CJK Unified
+      (cp >= 0xa000 && cp <= 0xa4cf) || // Yi
+      (cp >= 0xac00 && cp <= 0xd7a3) || // Hangul Syllables
+      (cp >= 0xf900 && cp <= 0xfaff) || // CJK Compat
+      (cp >= 0xfe30 && cp <= 0xfe4f) || // CJK Compat Forms
+      (cp >= 0xff00 && cp <= 0xff60) || // Fullwidth
+      (cp >= 0xffe0 && cp <= 0xffe6) ||
+      (cp >= 0x20000 && cp <= 0x2ffff) // CJK Extension B-F
+    ) {
+      w += 2;
+    } else {
+      w += 1;
+    }
+  }
+  return w;
+}
+
+function padVisual(s: string, target: number): string {
+  const diff = target - visualWidth(s);
+  return diff > 0 ? s + " ".repeat(diff) : s;
+}
+
+function parseRowCells(line: string): string[] {
+  let s = line.trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  return s.split("|").map((c) => c.replace(/\*\*([^*]+)\*\*/g, "$1").trim());
+}
+
+const isSepCell = (c: string) => /^:?-{3,}:?$/.test(c.trim());
+
+function formatTablesAsCodeBlocks(md: string): string {
+  const lines = md.split("\n");
+  const out: string[] = [];
+  let inFence = false;
+  let i = 0;
+  const sepLineRE = /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      out.push(line);
+      i++;
+      continue;
+    }
+    if (inFence) {
+      out.push(line);
+      i++;
+      continue;
+    }
+    const cur = line.trimStart();
+    const nxt = (lines[i + 1] ?? "").trimStart();
+    if (cur.startsWith("|") && sepLineRE.test(nxt)) {
+      // 收集整段表格
+      const block: string[] = [];
+      while (i < lines.length && lines[i].trimStart().startsWith("|")) {
+        block.push(lines[i]);
+        i++;
+      }
+      const rows = block.map((l) => {
+        const cells = parseRowCells(l);
+        return { cells, isSep: cells.length > 0 && cells.every(isSepCell) };
+      });
+      const colCount = Math.max(...rows.map((r) => r.cells.length));
+      const widths = new Array(colCount).fill(0);
+      for (const r of rows) {
+        if (r.isSep) continue;
+        for (let c = 0; c < r.cells.length; c++) {
+          widths[c] = Math.max(widths[c], visualWidth(r.cells[c]));
+        }
+      }
+      out.push("```");
+      for (const r of rows) {
+        const cells: string[] = [];
+        for (let c = 0; c < colCount; c++) {
+          cells.push(r.isSep ? "-".repeat(Math.max(3, widths[c])) : padVisual(r.cells[c] ?? "", widths[c]));
+        }
+        out.push("| " + cells.join(" | ") + " |");
+      }
+      out.push("```");
+      continue;
+    }
+    out.push(line);
+    i++;
+  }
+  return out.join("\n");
+}
+
 // ─── feishu send queue (per-chat) ────────────────────────────────────────────
 // Codex consult 指出：sendToFeishu fire-and-forget 在高吞吐下会丢消息/乱序/触发频控。
 // MVP 只发最终 result 时其实一次就够，但仍加一个最小 per-chat 队列：
@@ -141,6 +258,8 @@ function sendToFeishu(chatId: string, text: string) {
 
 function sendOneToFeishu(chatId: string, text: string): Promise<void> {
   return new Promise((resolve) => {
+    // 发前把 markdown 表格转成 ``` 代码块（飞书 post 格式不支持表格）
+    const payload = formatTablesAsCodeBlocks(text);
     let proc: ChildProcess;
     try {
       // 用 --markdown 而不是 --text：lark-cli 会自动转成 post 富文本格式
@@ -154,7 +273,7 @@ function sendOneToFeishu(chatId: string, text: string): Promise<void> {
         "--chat-id",
         chatId,
         "--markdown",
-        text,
+        payload,
       ]);
     } catch (err) {
       // binary not found 会同步 throw
