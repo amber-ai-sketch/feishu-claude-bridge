@@ -143,6 +143,9 @@ function sendOneToFeishu(chatId: string, text: string): Promise<void> {
   return new Promise((resolve) => {
     let proc: ChildProcess;
     try {
+      // 用 --markdown 而不是 --text：lark-cli 会自动转成 post 富文本格式
+      // 好处：飞书 App（尤其手机）会渲染 **加粗** / # 标题 / ``` 代码块 / 列表，不再是一坨裸字符
+      // 兜底：纯文本塞进 --markdown 也没问题，lark-cli 会当普通段落处理
       proc = spawn(LARK_CLI, [
         "im",
         "+messages-send",
@@ -150,7 +153,7 @@ function sendOneToFeishu(chatId: string, text: string): Promise<void> {
         "bot",
         "--chat-id",
         chatId,
-        "--text",
+        "--markdown",
         text,
       ]);
     } catch (err) {
@@ -245,6 +248,9 @@ function runClaude(
 
     let finalText = "";
     let sawResult = false;
+    let resultIsError = false;
+    let errorDetails = ""; // 组装好的错误信息（给飞书回发用）
+    let stderrTail = "";
 
     if (!claude.stdout || !claude.stderr) {
       console.error("[fcb] claude spawn missing stdio");
@@ -260,8 +266,31 @@ function runClaude(
         const msg = JSON.parse(line) as StreamJsonMessage;
         if (msg.type === "result") {
           sawResult = true;
-          // index signature makes msg.result `unknown`; narrow explicitly
-          finalText = typeof msg.result === "string" ? msg.result : "";
+          // result message 除了 "result" 字段，还有 is_error / subtype / errors 等诊断字段
+          const r = msg as {
+            is_error?: boolean;
+            subtype?: string;
+            result?: unknown;
+            errors?: unknown[];
+            stop_reason?: string;
+            api_error_status?: number | null;
+          };
+          if (r.is_error) {
+            resultIsError = true;
+            const parts: string[] = [];
+            if (r.subtype) parts.push(`type=${r.subtype}`);
+            if (r.stop_reason) parts.push(`stop=${r.stop_reason}`);
+            if (r.api_error_status != null) parts.push(`api_status=${r.api_error_status}`);
+            if (Array.isArray(r.errors) && r.errors.length > 0) {
+              parts.push(`errors=${r.errors.map(String).join(" / ")}`);
+            }
+            if (typeof r.result === "string" && r.result) {
+              parts.push(`result=${r.result}`);
+            }
+            errorDetails = parts.join(" | ") || "(no details in result message)";
+          } else if (typeof r.result === "string") {
+            finalText = r.result;
+          }
         }
         // O2: 进度流式 —— MVP 暂不转发 assistant partial / tool_use 事件。
         //     启用前必须先做 rate limit + 队列（见 design doc 7.2 "O2 前置条件"）。
@@ -272,15 +301,26 @@ function runClaude(
 
     claude.stderr.on("data", (d) => {
       const msg = d.toString().trim();
-      if (msg) console.error(`[claude] ${msg}`);
+      if (msg) {
+        console.error(`[claude] ${msg}`);
+        // 保留最后 500 字符，兜底给飞书（如果 result 没给错误细节）
+        stderrTail = (stderrTail + "\n" + msg).slice(-500);
+      }
     });
 
     claude.on("exit", (code) => {
-      console.log(`[fcb] claude exited chat=${chatId} code=${code} sawResult=${sawResult}`);
-      if (code === 0 && finalText) {
+      console.log(
+        `[fcb] claude exited chat=${chatId} code=${code} sawResult=${sawResult} isError=${resultIsError}`
+      );
+      // 优先级：happy path → result.is_error 细节 → stderr 兜底 → 裸退出码
+      if (code === 0 && finalText && !resultIsError) {
         sendToFeishu(chatId, finalText);
+      } else if (resultIsError && errorDetails) {
+        sendToFeishu(chatId, `❌ Claude Code 出错 (code=${code})\n${errorDetails}`);
       } else if (code === 0 && !sawResult) {
         sendToFeishu(chatId, "⚠️ Claude Code 正常退出但未产生 result 消息");
+      } else if (stderrTail) {
+        sendToFeishu(chatId, `❌ Claude Code 退出码 ${code}\nstderr: ${stderrTail.trim()}`);
       } else {
         sendToFeishu(chatId, `❌ Claude Code 退出码 ${code}`);
       }
