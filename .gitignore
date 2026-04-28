@@ -5,5 +5,12 @@ bun.lockb
 .env
 .env.local
 
-# state files (may contain session ids, not secrets but user-local)
+# state files (contain session ids, chat ids, model overrides — user-local)
 state/
+
+# 私人 TODO / Future Work（不入 repo，想法归想法、代码归代码）
+TODO.md
+
+# 用户本地生成的 LaunchAgent 实例（从 .template 派生）
+com.*.fcb.plist
+!com.example.fcb.plist.template

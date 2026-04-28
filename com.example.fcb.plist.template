@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent 模板：feishu-claude-bridge
+
+  使用步骤（也可以用仓库里的 scripts/install-launchagent.sh 一键生成）：
+    1. 复制到 ~/Library/LaunchAgents/ 并改名（Label 和文件名要一致）
+       cp com.example.fcb.plist.template ~/Library/LaunchAgents/com.yourname.fcb.plist
+    2. 把所有 {{HOME}} 换成你的 $HOME 绝对路径（launchd 不展开 ~）
+       sed -i '' "s|{{HOME}}|$HOME|g" ~/Library/LaunchAgents/com.yourname.fcb.plist
+    3. 把 {{FCB_OWNER_OPEN_IDS}} 换成你的飞书 open_id（见 README「拿到 open_id」）
+    4. 把 {{ANTHROPIC_API_KEY}} 换成你的 key，或删除这一对 key/string 改用
+       `launchctl setenv ANTHROPIC_API_KEY sk-xxx` 手动注入（避免明文落盘）
+    5. 加载：
+       launchctl load ~/Library/LaunchAgents/com.yourname.fcb.plist
+       launchctl start com.yourname.fcb
+       tail -f $HOME/.local/state/fcb/bridge.log
+
+  关键配置说明：
+    - RunAtLoad: 登录自启
+    - KeepAlive.SuccessfulExit=false: 非零退出码 = 拉起；正常退出 = 不拉起
+    - KeepAlive.NetworkState=true: 网络可用时才启动（合盖睡醒后断网不会疯转）
+    - ThrottleInterval=10: 崩溃后至少等 10 秒才重启（防 tight crash loop）
+
+  ⚠️ 安全提醒：
+    plist 里存 ANTHROPIC_API_KEY 属于 plaintext-at-rest，同机任何能读 ~/Library/
+    的进程都能看到。更安全的做法：
+      - 从 plist 里移除 ANTHROPIC_API_KEY 那一对 key/string
+      - 用 `launchctl setenv ANTHROPIC_API_KEY sk-xxx` 手动注入 launchd 环境
+      - 或者用 macOS Keychain + wrapper 脚本读出来再 exec bridge
+
+  卸载：
+    launchctl unload ~/Library/LaunchAgents/com.yourname.fcb.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.fcb</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/bun</string>
+    <string>run</string>
+    <string>{{HOME}}/Projects/feishu-claude-bridge/bridge.ts</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{HOME}}/Projects/feishu-claude-bridge</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+    <key>NetworkState</key>
+    <true/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>{{HOME}}/.local/state/fcb/bridge.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>{{HOME}}/.local/state/fcb/bridge.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- 必填：你的飞书 open_id（逗号分隔支持多个），见 README 拿 open_id 那节 -->
+    <key>FCB_OWNER_OPEN_IDS</key>
+    <string>{{FCB_OWNER_OPEN_IDS}}</string>
+
+    <!-- Anthropic API key。也可改用 launchctl setenv（见顶部注释） -->
+    <key>ANTHROPIC_API_KEY</key>
+    <string>{{ANTHROPIC_API_KEY}}</string>
+
+    <!-- 必须显式给 PATH，launchd 默认 PATH 很短 -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+
+    <!-- 可选：bridge 状态目录（不写默认 ~/.local/state/fcb） -->
+    <!-- <key>FCB_STATE_DIR</key><string>{{HOME}}/.local/state/fcb</string> -->
+
+    <!-- 可选：默认模型 alias（opus/sonnet/haiku，或完整 model id） -->
+    <!-- <key>FCB_CLAUDE_MODEL</key><string>opus</string> -->
+
+    <!-- 可选：如果用第三方 provider，把 ANTHROPIC_BASE_URL 指过去 -->
+    <!-- <key>ANTHROPIC_BASE_URL</key><string>https://your-provider.example.com/anthropic</string> -->
+  </dict>
+</dict>
+</plist>
