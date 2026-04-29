@@ -407,8 +407,34 @@ sed -i '' "s|^ANTHROPIC_API_KEY=$|ANTHROPIC_API_KEY=sk-ant-XXX|" .env
 
 # 前台跑一次自测 + 让用户飞书发 "pwd" 验证
 bun run bridge.ts
-# 看到 `whitelist=1` + `Connected.` 就 OK
-# 用户验证通过 Ctrl+C 后，按 README 进阶 A 装 tmux alias
+# 看到 `whitelist=1` + `Connected.` 就 OK，Ctrl+C 退出
+
+# 装 tmux（未装的话）
+command -v tmux >/dev/null || brew install tmux
+
+# 幂等地把 alias 写进用户的 shell rc 文件
+RC_FILE="$HOME/.zshrc"
+case "$(basename "$SHELL")" in
+  bash) RC_FILE="$HOME/.bashrc" ;;
+esac
+if ! grep -q "# fcb = feishu-claude-bridge" "$RC_FILE" 2>/dev/null; then
+  cat >> "$RC_FILE" <<'ALIASES'
+
+# fcb = feishu-claude-bridge 简写
+alias fcb-start='tmux new-session -d -s fcb -c ~/Projects/feishu-claude-bridge "bun run bridge.ts 2>&1 | tee -a ~/.local/state/fcb/bridge.log"'
+alias fcb-stop='tmux kill-session -t fcb'
+alias fcb-restart='fcb-stop 2>/dev/null; fcb-start'
+alias fcb-log='tail -f ~/.local/state/fcb/bridge.log'
+alias fcb-attach='tmux attach -t fcb'
+ALIASES
+  echo "✓ 已写入 alias 到 $RC_FILE"
+else
+  echo "✓ alias 已存在于 $RC_FILE，跳过"
+fi
+
+# 在当前 shell 马上起一次 bridge（新开终端需 source $RC_FILE 或开新 tab 才能用 alias）
+tmux new-session -d -s fcb -c ~/Projects/feishu-claude-bridge \
+  "bun run bridge.ts 2>&1 | tee -a ~/.local/state/fcb/bridge.log"
 ```
 
 自测必做：每次改完或重启前 `claude --version` / `lark-cli --version` 各跑一次，验证外部 CLI 活着；bridge 启动日志里 `whitelist=N` 的 N 应等于 `FCB_OWNER_OPEN_IDS` 逗号分隔的个数。
@@ -418,7 +444,7 @@ bun run bridge.ts
 ````markdown
 ✅ feishu-claude-bridge 装好了。bridge 已在 tmux session `fcb` 里跑着，现在可以飞书 @bot 试了。
 
-**以后日常只需要这 5 个命令**（已装进你的 `~/.zshrc`，先 `source ~/.zshrc` 或开新终端生效）：
+**以后日常只需要这 5 个命令**（alias 已经写进你的 shell rc 文件，跑 `source ~/.zshrc` 或开新终端就能用）：
 
 ```
 fcb-start     # 起 bridge
@@ -439,7 +465,7 @@ fcb-stop      # 停 bridge
 - 安全底线：飞书账号开 2FA。账号被盗 = 你这台 Mac 被盗。
 ````
 
-如果 agent 没给用户装 alias（用户没确认、或者非 zsh 环境），把 alias 块和 README 进阶 A 的链接也一并发回给用户让他自己装。
+如果 agent 跳过了 alias 自动写入（用户拒绝、或非 zsh/bash 环境），把 README 进阶 A 节的 alias 块贴给用户让他自己装。
 
 ---
 
