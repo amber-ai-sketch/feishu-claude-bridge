@@ -409,11 +409,21 @@ function formatToolCall(name: string, input: unknown): string {
 
 const claudeQueues = new Map<string, Promise<void>>();
 
+type RunOpts = {
+  isFreshSession: boolean;
+  // 覆盖 getChatModel(chatId)，仅对本次 spawn 生效。用于图片分析时临时切 vision
+  // 能力更强的模型（如 haiku 主对话切 sonnet 分析图片）而不污染 chatModels。
+  modelOverride?: string;
+  // 一次性 session：不 markSessionStarted（sessionId 不进 sessions[chatId]），
+  // 消息回发不做 stale 前缀判断（因为 sessionId 永远不会是 active，但也不是 "旧会话"）。
+  adHoc?: boolean;
+};
+
 function enqueueClaudeRun(
   chatId: string,
   sessionId: string,
   prompt: string,
-  opts: { isFreshSession: boolean }
+  opts: RunOpts
 ) {
   const prev = claudeQueues.get(sessionId) ?? Promise.resolve();
   const next = prev.then(() => runClaude(sessionId, chatId, prompt, opts));
@@ -454,12 +464,13 @@ function runClaude(
   sessionId: string,
   chatId: string,
   prompt: string,
-  opts: { isFreshSession: boolean }
+  opts: RunOpts
 ): Promise<void> {
   return new Promise((resolve) => {
     // 本次 runClaude 结束前，把累积在 pendingBtw[sessionId] 里的 /btw 追加消息 flush
     // 成一次合并的 --resume 调用。必须在 resolve() 之前调用 enqueueClaudeRun，
     // 这样新 run 会被链在当前 promise 之后、同 session 串行。
+    // （adHoc session 的 sessionId 不会出现在 pendingBtw，这里自然 no-op）
     const finishRun = () => {
       const pending = pendingBtw.get(sessionId);
       if (pending && pending.length > 0) {
@@ -470,7 +481,14 @@ function runClaude(
       resolve();
     };
 
-    const model = getChatModel(chatId);
+    // adHoc 模式的消息直接发飞书，不走 stale 判定（sessionId 不在 sessions[chatId] 里，
+    // sendForSession 会把它当 stale 加 [📜 旧会话] 前缀 —— 不是想要的语义）
+    const sendProgress = (text: string) =>
+      opts.adHoc ? sendToFeishu(chatId, text) : sendForSession(chatId, sessionId, text, "progress");
+    const sendResult = (text: string) =>
+      opts.adHoc ? sendToFeishu(chatId, text) : sendForSession(chatId, sessionId, text, "result");
+
+    const model = opts.modelOverride ?? getChatModel(chatId);
     // 首次用 --session-id 新建；之后必须用 --resume，否则 claude 报 "session ... already in use"
     const sessionFlag = opts.isFreshSession ? "--session-id" : "--resume";
     console.log(
@@ -500,11 +518,13 @@ function runClaude(
           stdio: ["ignore", "pipe", "pipe"],
         }
       );
-      // spawn 的那一刻即标记 started —— 不管后续成败，session id 都被 claude 登记了
-      markSessionStarted(chatId);
+      // spawn 的那一刻即标记 started —— 不管后续成败，session id 都被 claude 登记了。
+      // adHoc 模式的 sessionId 不进 sessions[chatId]，所以也别把 chatId 标 started，
+      // 否则主 session 下条消息会走 --resume 到一个 claude 没登记过的 sid。
+      if (!opts.adHoc) markSessionStarted(chatId);
     } catch (err) {
       console.error(`[fcb] claude spawn threw (binary missing?):`, err);
-      sendForSession(chatId, sessionId, `❌ 无法启动 Claude Code: ${(err as Error).message}`, "result");
+      sendResult(`❌ 无法启动 Claude Code: ${(err as Error).message}`);
       finishRun();
       return;
     }
@@ -522,20 +542,20 @@ function runClaude(
       ? null
       : setTimeout(() => {
           if (!progressSent) {
-            sendForSession(chatId, sessionId, "⏳ Claude 还在想，稍等...", "progress");
+            sendProgress("⏳ Claude 还在想，稍等...");
             progressSent = true;
           }
         }, HEARTBEAT_MS);
 
     function emitProgress(text: string) {
       if (PROGRESS_DISABLED) return;
-      sendForSession(chatId, sessionId, text, "progress");
+      sendProgress(text);
       progressSent = true;
     }
 
     if (!claude.stdout || !claude.stderr) {
       console.error("[fcb] claude spawn missing stdio");
-      sendForSession(chatId, sessionId, "❌ Claude Code 进程 stdio 异常", "result");
+      sendResult("❌ Claude Code 进程 stdio 异常");
       if (heartbeat) clearTimeout(heartbeat);
       finishRun();
       return;
@@ -618,15 +638,15 @@ function runClaude(
       );
       // 优先级：happy path → result.is_error 细节 → stderr 兜底 → 裸退出码
       if (code === 0 && finalText && !resultIsError) {
-        sendForSession(chatId, sessionId, finalText, "result");
+        sendResult(finalText);
       } else if (resultIsError && errorDetails) {
-        sendForSession(chatId, sessionId, `❌ Claude Code 出错 (code=${code})\n${errorDetails}`, "result");
+        sendResult(`❌ Claude Code 出错 (code=${code})\n${errorDetails}`);
       } else if (code === 0 && !sawResult) {
-        sendForSession(chatId, sessionId, "⚠️ Claude Code 正常退出但未产生 result 消息", "result");
+        sendResult("⚠️ Claude Code 正常退出但未产生 result 消息");
       } else if (stderrTail) {
-        sendForSession(chatId, sessionId, `❌ Claude Code 退出码 ${code}\nstderr: ${stderrTail.trim()}`, "result");
+        sendResult(`❌ Claude Code 退出码 ${code}\nstderr: ${stderrTail.trim()}`);
       } else {
-        sendForSession(chatId, sessionId, `❌ Claude Code 退出码 ${code}`, "result");
+        sendResult(`❌ Claude Code 退出码 ${code}`);
       }
       finishRun();
     });
@@ -634,7 +654,7 @@ function runClaude(
     claude.on("error", (err) => {
       if (heartbeat) clearTimeout(heartbeat);
       console.error(`[fcb] claude spawn error:`, err);
-      sendForSession(chatId, sessionId, `❌ 无法启动 Claude Code: ${err.message}`, "result");
+      sendResult(`❌ 无法启动 Claude Code: ${err.message}`);
       finishRun();
     });
   });
@@ -1040,6 +1060,26 @@ function handleImageMessage(chatId: string, messageId: string, imageKey: string)
       return;
     }
     const absPath = join(runDir, files[0]);
+    const curModel = getChatModel(chatId);
+    // haiku 4.5 vision 能力极不稳：实测会把红三角图说成"JSON 日志"完全幻觉。
+    // 即便 @path 让 claude 调 Read 拿到真图 base64，haiku 看了也照编。
+    // 所以 haiku 主对话时，图片走独立一次性 session + sonnet 分析，不碰主 session
+    // model/history —— 避免跨 family thinking block 签名冲突（见 35288c8）。
+    const modelIsHaiku = /haiku/i.test(curModel);
+    if (modelIsHaiku) {
+      const adHocSid = randomUUID();
+      sendToFeishu(
+        chatId,
+        `🖼 当前模型 \`${curModel}\` 识图能力不稳，本次图片改用 sonnet 独立分析（主对话 model 和上下文不变）`
+      );
+      enqueueClaudeRun(chatId, adHocSid, `请分析这张图片：@${absPath}`, {
+        isFreshSession: true,
+        modelOverride: "sonnet",
+        adHoc: true,
+      });
+      return;
+    }
+    // opus / sonnet 等 vision 足够，复用主 session，图可纳入对话上下文
     const { id: sessionId, started } = getOrCreateInteractiveSession(chatId);
     enqueueClaudeRun(chatId, sessionId, `请分析这张图片：@${absPath}`, {
       isFreshSession: !started,
