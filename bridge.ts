@@ -155,10 +155,24 @@ function markSessionStarted(chatId: string) {
 }
 
 function resetInteractiveSession(chatId: string) {
+  const oldSid = sessions[chatId];
+  if (oldSid != null) pendingBtw.delete(oldSid); // 用户切走了，丢弃缓冲的 /btw 追加
   delete sessions[chatId];
   startedSessions.delete(chatId);
   saveSessions();
 }
+
+// ─── /btw 追加消息缓冲 ───────────────────────────────────────────────────────
+// session 的 claude 进程正在 running 时，用户又发的消息视为 "/btw 补充"：
+// 不开独立 turn，而是缓冲起来，当前任务结束后合并成一次 --resume 调用。
+//
+// 背景：claude -p 模式一次 spawn 一次响应，stdin 关闭，无法 inject 到 running 进程。
+// 交互模式的真·"执行中 /btw 注入"在 bridge 里做不到。所以 bridge 的 /btw 实际
+// 语义是 "延迟到任务结束后、合并成一条新 turn 发送"，Claude 看到 history + /btw
+// 前缀会理解为补充而非新任务。
+//
+// key: sessionId, value: 用户连发的若干文本
+const pendingBtw = new Map<string, string[]>();
 
 // ─── markdown 预处理：表格 → 代码块 ──────────────────────────────────────────
 // 飞书 post 富文本格式 **不支持表格**（CHANGELOG 里也从未出现 table 支持）。
@@ -443,6 +457,19 @@ function runClaude(
   opts: { isFreshSession: boolean }
 ): Promise<void> {
   return new Promise((resolve) => {
+    // 本次 runClaude 结束前，把累积在 pendingBtw[sessionId] 里的 /btw 追加消息 flush
+    // 成一次合并的 --resume 调用。必须在 resolve() 之前调用 enqueueClaudeRun，
+    // 这样新 run 会被链在当前 promise 之后、同 session 串行。
+    const finishRun = () => {
+      const pending = pendingBtw.get(sessionId);
+      if (pending && pending.length > 0) {
+        pendingBtw.delete(sessionId);
+        const combined = pending.map((t) => `/btw ${t}`).join("\n\n");
+        enqueueClaudeRun(chatId, sessionId, combined, { isFreshSession: false });
+      }
+      resolve();
+    };
+
     const model = getChatModel(chatId);
     // 首次用 --session-id 新建；之后必须用 --resume，否则 claude 报 "session ... already in use"
     const sessionFlag = opts.isFreshSession ? "--session-id" : "--resume";
@@ -478,7 +505,7 @@ function runClaude(
     } catch (err) {
       console.error(`[fcb] claude spawn threw (binary missing?):`, err);
       sendForSession(chatId, sessionId, `❌ 无法启动 Claude Code: ${(err as Error).message}`, "result");
-      resolve();
+      finishRun();
       return;
     }
 
@@ -510,7 +537,7 @@ function runClaude(
       console.error("[fcb] claude spawn missing stdio");
       sendForSession(chatId, sessionId, "❌ Claude Code 进程 stdio 异常", "result");
       if (heartbeat) clearTimeout(heartbeat);
-      resolve();
+      finishRun();
       return;
     }
 
@@ -601,14 +628,14 @@ function runClaude(
       } else {
         sendForSession(chatId, sessionId, `❌ Claude Code 退出码 ${code}`, "result");
       }
-      resolve();
+      finishRun();
     });
 
     claude.on("error", (err) => {
       if (heartbeat) clearTimeout(heartbeat);
       console.error(`[fcb] claude spawn error:`, err);
       sendForSession(chatId, sessionId, `❌ 无法启动 Claude Code: ${err.message}`, "result");
-      resolve();
+      finishRun();
     });
   });
 }
@@ -769,6 +796,21 @@ function handleIncomingEvent(envelope: LarkEventEnvelope) {
   }
 
   const { id: sessionId, started } = getOrCreateInteractiveSession(chatId);
+
+  // session 正在 running 时，后续消息视为 /btw 追加：
+  // 缓冲起来，在当前 claude 进程 exit 后合并成一次 --resume 调用（见 runClaude.on("exit")）。
+  // claudeQueues.has(sessionId) = true 表示有 promise 挂在该 session 的队列上（正在跑或排队）。
+  if (claudeQueues.has(sessionId)) {
+    const buf = pendingBtw.get(sessionId) ?? [];
+    buf.push(text);
+    pendingBtw.set(sessionId, buf);
+    sendToFeishu(
+      chatId,
+      `📥 已加入 /btw 队列（第 ${buf.length} 条，当前任务完成后合并追加到同一 session）`
+    );
+    return;
+  }
+
   enqueueClaudeRun(chatId, sessionId, text, { isFreshSession: !started });
 }
 
@@ -1049,8 +1091,6 @@ type SessionInfo = {
 const SYSTEM_CONTENT_PREFIXES = [
   "<local-command-caveat>",
   "<local-command-stdout>",
-  "<command-name>",
-  "<command-message>",
   "<command-args>",
 ];
 
@@ -1059,16 +1099,31 @@ function isSystemMetaContent(content: string): boolean {
   return SYSTEM_CONTENT_PREFIXES.some((p) => trimmed.startsWith(p));
 }
 
+// 从 <command-*> 消息里提取命令名 + 参数做预览
+// 支持两种标签顺序：<command-name>...<command-message> 和反过来
+function extractCommandPreview(content: string): string {
+  const cmdMatch = content.match(/<command-name>([\s\S]*?)<\/command-name>/);
+  const msgMatch = content.match(/<command-message>([\s\S]*?)<\/command-message>/);
+  const cmd = cmdMatch?.[1]?.trim() ?? "";
+  const msg = msgMatch?.[1]?.trim() ?? "";
+  const preview = (cmd + " " + msg).replace(/\s+/g, " ").trim();
+  return preview ? preview.slice(0, 80) : "";
+}
+
 function extractFirstUserMessage(filePath: string): string {
   // Claude Code 的 JSONL 里第一条 user 消息格式有几种：
   //   - {type:"user", message:{role:"user", content:"..."|[...]}}
   //   - {type:"queue-operation", operation:"enqueue", content:"..."}（某些版本）
   //   - {type:"ai-title", aiTitle:"..."}（Claude 自动生成的标题，最佳来源）
-  // 只扫前 200 行（开头 meta/系统消息可能很多），免得读大文件
+  // 兜底来源（当用户消息全是系统命令/通知时）：
+  //   - <task-notification> 里的 <summary>
+  //   - <command-*> 消息里提取命令名
+  // 扫前 500 行（开头 meta/系统消息可能很多，尤其 monitor/cron 启动的 session）
   let aiTitle = "";
+  let fallbackPreview = ""; // 兜底预览（命令/通知摘要）
   try {
     const raw = readFileSync(filePath, "utf-8");
-    const lines = raw.split("\n").slice(0, 200);
+    const lines = raw.split("\n").slice(0, 500);
     for (const line of lines) {
       if (!line) continue;
       try {
@@ -1083,8 +1138,17 @@ function extractFirstUserMessage(filePath: string): string {
           typeof obj.content === "string"
         ) {
           const trimmed = obj.content.trim();
-          if (!isSystemMetaContent(trimmed)) {
+          // 提取命令名做兜底预览（而非返回 XML 标签）
+          if (trimmed.startsWith("<command-")) {
+            if (!fallbackPreview) {
+              fallbackPreview = extractCommandPreview(trimmed);
+            }
+          } else if (!isSystemMetaContent(trimmed)) {
             return trimmed.replace(/\s+/g, " ").slice(0, 80);
+          } else if (!fallbackPreview && trimmed.startsWith("<task-notification>")) {
+            // 兜底：从 task-notification 提取 <summary>
+            const m = trimmed.match(/<summary>([\s\S]*?)<\/summary>/);
+            if (m?.[1]) fallbackPreview = m[1].replace(/\s+/g, " ").trim().slice(0, 80);
           }
         }
         if (obj.type === "user") {
@@ -1097,9 +1161,16 @@ function extractFirstUserMessage(filePath: string): string {
           const content = message.content;
           if (typeof content === "string") {
             const trimmed = content.trim();
-            // 跳过系统命令类消息（/model、local-command 等）
+            // 跳过系统注入的 meta 消息（local-command-caveat / local-command-stdout 等）
+            if (trimmed.startsWith("<local-command-")) continue;
+            // 提取命令名做兜底预览（/model、/init、/mcp 等）
+            if (trimmed.startsWith("<command-")) {
+              if (!fallbackPreview) {
+                fallbackPreview = extractCommandPreview(trimmed);
+              }
+              continue;
+            }
             if (isSystemMetaContent(trimmed)) continue;
-            if (trimmed.startsWith("<command-")) continue;
             return trimmed.replace(/\s+/g, " ").slice(0, 80);
           }
           if (Array.isArray(content)) {
@@ -1112,6 +1183,13 @@ function extractFirstUserMessage(filePath: string): string {
                 typeof (c as { text?: string }).text === "string"
               ) {
                 const text = (c as { text: string }).text.trim();
+                if (text.startsWith("<local-command-")) continue;
+                if (text.startsWith("<command-")) {
+                  if (!fallbackPreview) {
+                    fallbackPreview = extractCommandPreview(text);
+                  }
+                  continue;
+                }
                 if (isSystemMetaContent(text)) continue;
                 return text.replace(/\s+/g, " ").slice(0, 80);
               }
@@ -1125,8 +1203,8 @@ function extractFirstUserMessage(filePath: string): string {
   } catch {
     /* 读不了返回空 */
   }
-  // 兜底：用 Claude 自动生成的标题（如果有）
-  return aiTitle || "(无 user 消息)";
+  // 兜底优先级：ai-title > 命令/通知摘要 > 兜底提示
+  return aiTitle || fallbackPreview || "(无 user 消息)";
 }
 
 function listRecentSessions(limit: number): SessionInfo[] {
@@ -1241,6 +1319,10 @@ function handleResumeCommand(chatId: string, arg: string) {
   }
   const target = cache[idx - 1];
   // 关键：把 chat 的 session 指向历史 session_id，并标记 started（触发 --resume）
+  const oldSid = sessions[chatId];
+  if (oldSid != null && oldSid !== target.sessionId) {
+    pendingBtw.delete(oldSid); // 切走到另一 session，原 session 的 /btw 追加丢弃
+  }
   sessions[chatId] = target.sessionId;
   startedSessions.add(chatId);
   saveSessions();
