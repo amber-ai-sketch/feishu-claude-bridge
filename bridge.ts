@@ -423,8 +423,10 @@ function runClaude(
           };
           if (r.is_error) {
             resultIsError = true;
+            // 注意：subtype 在 result 消息里是 "Claude Code 流程完成度"的标志
+            // （success / interrupted / error_during_execution），不是 "请求成功"
+            // 容易被误读成 "既然 type=success 为什么还报错"，所以不往飞书发
             const parts: string[] = [];
-            if (r.subtype) parts.push(`type=${r.subtype}`);
             if (r.stop_reason) parts.push(`stop=${r.stop_reason}`);
             if (r.api_error_status != null) parts.push(`api_status=${r.api_error_status}`);
             if (Array.isArray(r.errors) && r.errors.length > 0) {
@@ -583,32 +585,61 @@ function handleModelCommand(chatId: string, arg: string) {
         `  /model sonnet     切换到 sonnet 别名（→ ANTHROPIC_DEFAULT_SONNET_MODEL）\n` +
         `  /model haiku      切换到 haiku 别名（→ ANTHROPIC_DEFAULT_HAIKU_MODEL）\n` +
         `  /model <完整 id>  例如 claude-opus-4-7\n` +
-        `  /model reset      清除覆盖，回到全局默认 (${CLAUDE_MODEL})`
+        `  /model reset      清除覆盖，回到全局默认 (${CLAUDE_MODEL})\n` +
+        `\n` +
+        `注意：切换模型会重置当前频道的对话上下文（跨 model family 的 thinking block\n` +
+        `签名不兼容，续传会被 API 拒绝）。如需保留上下文请别切换，或在 TODO.md 里\n` +
+        `跟踪 per-(chat,model) session 隔离的改进。`
     );
     return;
   }
 
-  // 重置到全局默认
+  // 目标 model：要么是 arg，要么是全局默认（reset 场景）
+  const nextModel =
+    arg === "reset" || arg === "default" ? CLAUDE_MODEL : arg;
+  const prevModel = getChatModel(chatId);
+
+  // reset：清除覆盖
   if (arg === "reset" || arg === "default") {
     delete chatModels[chatId];
     saveChatModels();
-    sendToFeishu(chatId, `✅ 已清除覆盖，回到全局默认模型: ${CLAUDE_MODEL}`);
-    return;
+  } else {
+    // 简单校验：限长 + 拒绝控制字符
+    if (arg.length > 100 || /[\n\r\t]/.test(arg)) {
+      sendToFeishu(chatId, "❌ 模型名称非法（过长或含控制字符）");
+      return;
+    }
+    chatModels[chatId] = arg;
+    saveChatModels();
   }
 
-  // 简单校验：限长 + 拒绝控制字符
-  if (arg.length > 100 || /[\n\r\t]/.test(arg)) {
-    sendToFeishu(chatId, "❌ 模型名称非法（过长或含控制字符）");
-    return;
+  // 关键：model 真的变了时必须重置 session。
+  // 跨 model family 续传会触发 Anthropic API 的 "Invalid signature in thinking
+  // block" 400（opus 的 extended thinking 历史 haiku 验证不过，反之亦然）。
+  const modelChanged = prevModel !== nextModel;
+  if (modelChanged) {
+    resetInteractiveSession(chatId);
   }
 
-  chatModels[chatId] = arg;
-  saveChatModels();
   const hint =
     arg === "opus" || arg === "sonnet" || arg === "haiku"
       ? `（Claude Code 会解析为 ANTHROPIC_DEFAULT_${arg.toUpperCase()}_MODEL 配置的实际 id）`
       : "";
-  sendToFeishu(chatId, `✅ 当前频道模型已切换到: ${arg}${hint}`);
+  const resetNote = modelChanged
+    ? "\n⚠️ 由于切换了模型，已重置对话上下文（下条消息开新 session）"
+    : "";
+
+  if (arg === "reset" || arg === "default") {
+    sendToFeishu(
+      chatId,
+      `✅ 已清除覆盖，回到全局默认模型: ${CLAUDE_MODEL}${resetNote}`
+    );
+  } else {
+    sendToFeishu(
+      chatId,
+      `✅ 当前频道模型已切换到: ${arg}${hint}${resetNote}`
+    );
+  }
 }
 
 // ─── lark-cli event subscription daemon (with watchdog) ──────────────────────
