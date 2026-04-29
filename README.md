@@ -2,9 +2,18 @@
 
 > Co-author：Claude Opus 4.7
 
-把 **飞书** 变成 **Claude Code CLI** 的远程对讲机。
+把 **飞书** 变成 **Claude Code CLI** 的远程对讲机。人在外面、机器在家里：飞书 @bot 发消息 → 家里的 Mac 跑 Claude Code → 结果推回飞书。
 
-人在外面、机器在家里：飞书 @bot 发消息触发 Claude Code，Claude 跑完把结果推回飞书。支持长对话上下文（每个飞书频道对应一个长期 Claude session）、per-频道模型切换（`/model haiku` 省钱/`/model opus` 性能）、定时任务（"每天 9 点汇总错误日志"）。
+**能干什么**：
+
+- 远程调度家里/公司 Mac 的 Claude Code，做文件操作、跑脚本、审 diff、查日志
+- 每个飞书频道保持独立上下文（长对话不断线）
+- per-频道切模型（`/model haiku` 省钱、`/model opus` 认真活）
+- 定时任务："每天 9 点扫 `/var/log` 里的 ERROR 发我飞书摘要"
+
+**不是什么**：不是通用聊天机器人；不是多租户 SaaS；是**单人单机自用**的 personal remote。
+
+**架构**：
 
 ```
 lark-cli event +subscribe              # 长连接接飞书事件（NDJSON stdout）
@@ -15,6 +24,8 @@ claude -p --session-id <uuid>          # Claude Code 干活
         ↓
 lark-cli im +messages-send             # Claude 用 skill 发消息回飞书
 ```
+
+**目录**：[安全前置](#-装之前读完这段) · [前置条件](#前置条件) · [Step 0 飞书应用](#step-0飞书应用--lark-cli-配置一次性-30-分钟) · [Step 1 克隆](#step-1克隆--装依赖) · [Step 2 跑起来](#step-2跑起来) · [飞书里能发什么](#飞书里能发什么) · [故障排查](#故障排查) · [进阶（tmux / 自启 / 定时任务）](#进阶长期运行--定时任务)
 
 ---
 
@@ -35,14 +46,15 @@ lark-cli im +messages-send             # Claude 用 skill 发消息回飞书
 
 ## 前置条件
 
-1. **macOS**（如果要走文末「进阶：LaunchAgent 自启」；bridge 本身在 Linux 也跑，自启机制自己换）
+1. **macOS**（只在进阶 LaunchAgent 用到；bridge 代码本身 Linux 也跑，自启机制自己换）
 2. **Bun** `>= 1.0` — `curl -fsSL https://bun.sh/install | bash`
-3. **Claude Code CLI** 可通过 `claude` 命令直接调用
-   - Claude Code 下载：https://claude.com/claude-code
-   - 如果 `which claude` 找不到或者坏了，用 `FCB_CLAUDE_CLI=/absolute/path/to/claude` 显式指定
-4. **`ANTHROPIC_API_KEY`** 配好（env 或 `~/.claude/settings.json`）
-5. **飞书自建应用** 已注册（下面 Step 0 教）
-6. **lark-cli** 已装并 OAuth 登录（参考 Step 0）
+3. **Claude Code CLI** —  `claude --version` 在你 shell 里能跑
+   - 下载：https://claude.com/claude-code
+   - `claude` 不在 PATH 里 → 用 `FCB_CLAUDE_CLI=/absolute/path/to/claude` 覆盖
+4. **Claude API 凭证** 二选一：
+   - Anthropic 官方：在 `.env`（Step 2 会建）里填 `ANTHROPIC_API_KEY=sk-ant-xxx`
+   - 第三方 Anthropic-compatible provider：`.env` 里再填 `ANTHROPIC_BASE_URL=https://...` + 对应 model 映射
+5. **飞书自建应用** 已注册 + **lark-cli** 已装并 OAuth 登录（下面 Step 0 教）
 
 ---
 
@@ -101,38 +113,30 @@ bun install
 
 ---
 
-## Step 2：本地 dev 跑起来
-
-### 真接飞书模式
+## Step 2：跑起来
 
 ```bash
-# 拷贝 env 模板，填你的 open_id
+# 1. 填 env（.env 在 .gitignore 里，不会入 repo）
 cp .env.example .env
-vim .env   # 把 FCB_OWNER_OPEN_IDS 填成你的 ou_xxx
+vim .env
+# 必填：FCB_OWNER_OPEN_IDS=你的 ou_xxx（Step 0.3 拿到的）
+# 必填：ANTHROPIC_API_KEY=sk-ant-xxx（或 Anthropic-compatible provider 的凭证组合）
 
-# 跑（Bun 自动读项目根 .env，不用 source）
+# 2. 跑（Bun 自动读项目根 .env，不用 source）
 bun run bridge.ts
 ```
 
-然后飞书私聊 bot："pwd"。正常会 30 秒内收到当前目录。
+终端应该看到：
 
-### fake-event 模式（不连飞书，本地自测路由逻辑）
-
-```bash
-FCB_OWNER_OPEN_IDS=ou_test \
-FCB_LARK_CLI="$(pwd)/fake-event.ts" \
-bun run bridge.ts
+```
+[fcb] bridge started | whitelist=1 chats=0 crons=0 model=opus
+[fcb] starting lark-cli event +subscribe
+[lark-cli] Connected. Waiting for events...
 ```
 
-bridge 会 spawn `fake-event.ts` 做"假 lark-cli"，依次喂几条测试事件进来：
-- 白名单命中的 text 消息 → bridge 应调 claude（实际要看你本地 claude 能不能跑）
-- 白名单不命中 → bridge 应忽略
-- image 类型 → bridge 应回"只识别纯文本"
-- `/new` → bridge 应重置 session
+`whitelist=1` + `Connected.` = OK。飞书私聊 bot 发"pwd"，30 秒内应收到当前目录。
 
-看 bridge log 确认行为符合预期。
-
-**到这里主流程就跑通了**。下面的「进阶」章节是可选增强。
+**到这里主流程跑通**。长期运行（tmux / 自启 / 定时任务）见文末[进阶](#进阶长期运行--定时任务)章节。
 
 ---
 
@@ -259,7 +263,7 @@ tmux new-session -d -s fcb -c ~/Projects/feishu-claude-bridge \
   "bun run bridge.ts 2>&1 | tee -a ~/.local/state/fcb/bridge.log"
 ```
 
-**嫌每次打这串长命令烦**，把下面这段塞到 `~/.zshrc`：
+**强烈推荐把这段 alias 塞到 `~/.zshrc`**，以后一个词搞定：
 
 ```bash
 # fcb = feishu-claude-bridge 简写
@@ -270,30 +274,17 @@ alias fcb-log='tail -f ~/.local/state/fcb/bridge.log'
 alias fcb-attach='tmux attach -t fcb'
 ```
 
-以后就 `fcb-start` / `fcb-restart` / `fcb-log` 一个词搞定。
+装完 `source ~/.zshrc` 生效。日常就这五个：
 
-**日常操作**：
+| 命令 | 作用 |
+|---|---|
+| `fcb-start` | 在 tmux session 里起 bridge |
+| `fcb-log` | 不进 tmux，实时看 log |
+| `fcb-attach` | 进 tmux session（Ctrl-b 再按 d 脱离、不杀 bridge） |
+| `fcb-restart` | 改了代码后重启 bridge |
+| `fcb-stop` | 停 bridge |
 
-```bash
-# 看 bridge 活没活
-tmux list-sessions
-
-# 进 session 看 live log（按 Ctrl-b 然后按 d 脱离，不杀 bridge）
-tmux attach -t fcb
-
-# 不进 session 看 log
-tail -f ~/.local/state/fcb/bridge.log
-
-# 停 bridge
-tmux kill-session -t fcb
-
-# 改了代码要重启
-tmux kill-session -t fcb
-tmux new-session -d -s fcb -c ~/Projects/feishu-claude-bridge \
-  "bun run bridge.ts 2>&1 | tee -a ~/.local/state/fcb/bridge.log"
-```
-
-如果你把长的 `tmux new-session ...` 命令塞到 `~/.zshrc` 的 alias 里，每次就 `fcb-start` 一下就行。
+判活一眼：`tmux list-sessions` 看到 `fcb:` 就是还活着。
 
 ### B. LaunchAgent 自启（macOS，稳定期用）
 
@@ -367,6 +358,58 @@ launchctl stop com.yourname.fcb && launchctl start com.yourname.fcb
 ```
 
 **注意**：飞书里动态管 cron（`/cron add ...`）还没实现，目前只能改这个 JSON 文件。见 `TODO.md`（仓库 Issue 区欢迎讨论）。
+
+---
+
+## 开发 / 调试
+
+**不连飞书，本地测路由逻辑**（改 bridge.ts 时用）：
+
+```bash
+FCB_OWNER_OPEN_IDS=ou_test \
+FCB_LARK_CLI="$(pwd)/fake-event.ts" \
+bun run bridge.ts
+```
+
+bridge 会 spawn `fake-event.ts` 当假 lark-cli，依次喂几条测试事件：白名单命中的 text、白名单外的消息、image 类型、`/new` 等。log 里看 bridge 行为。
+
+**preflight 失败**：bridge 启动时会 spawnSync `claude --version` 和 `lark-cli --version`，任一失败 FATAL exit 1。典型触发：VSCode Claude Code 插件升级后 `/opt/homebrew/bin/claude` symlink 指向已删除目录 —— 按故障排查那节重建 symlink。
+
+---
+
+## 给 AI Agent 的部署指引
+
+如果你是 AI agent 被要求"帮我把这个装到机器上"，流程拆成两段：
+
+**第一段（必须人工 + 浏览器）**：Step 0.1 在飞书开放平台创建应用、配权限、发布 —— 向人要 App ID + App Secret 再继续。
+
+**第二段（你可以全自动）**：
+
+```bash
+# 装 lark-cli + 登录（lark-cli config init 是交互式，需要让用户把 App ID/Secret 贴到你的 prompt）
+npm install -g @larksuite/cli
+# 或者把 App ID/Secret 直接写到 ~/.lark-cli/config.json（schema 见 lark-cli 文档）
+
+lark-cli auth login --recommend    # 这步会开浏览器 OAuth，需要人配合
+lark-cli contact +users-search --query "用户提供的邮箱或姓名"   # 拿 open_id
+
+# clone + install
+git clone https://github.com/amber-ai-sketch/feishu-claude-bridge.git ~/Projects/feishu-claude-bridge
+cd ~/Projects/feishu-claude-bridge
+bun install
+
+# 填 .env
+cp .env.example .env
+sed -i '' "s|^FCB_OWNER_OPEN_IDS=$|FCB_OWNER_OPEN_IDS=ou_XXX|" .env
+sed -i '' "s|^ANTHROPIC_API_KEY=$|ANTHROPIC_API_KEY=sk-ant-XXX|" .env
+
+# 前台跑一次自测 + 让用户飞书发 "pwd" 验证
+bun run bridge.ts
+# 看到 `whitelist=1` + `Connected.` 就 OK
+# 用户验证通过 Ctrl+C 后，按 README 进阶 A 装 tmux alias
+```
+
+自测必做：每次改完或重启前 `claude --version` / `lark-cli --version` 各跑一次，验证外部 CLI 活着；bridge 启动日志里 `whitelist=N` 的 N 应等于 `FCB_OWNER_OPEN_IDS` 逗号分隔的个数。
 
 ---
 
