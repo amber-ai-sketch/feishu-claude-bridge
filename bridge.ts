@@ -15,7 +15,15 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  rmSync,
+} from "node:fs";
 import { createInterface } from "node:readline";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -27,6 +35,12 @@ const STATE_DIR = process.env.FCB_STATE_DIR ?? join(homedir(), ".local/state/fcb
 const SESSIONS_FILE = join(STATE_DIR, "sessions.json");
 const CRONTAB_FILE = join(STATE_DIR, "crontab.json");
 const CHAT_MODELS_FILE = join(STATE_DIR, "chat-models.json");
+const IMAGES_DIR = join(STATE_DIR, "images");
+const CCUSAGE_SCRIPT =
+  process.env.FCB_CCUSAGE_SCRIPT ??
+  join(homedir(), ".claude/skills/ccusage-report/generate-report.ts");
+const CLAUDE_PROJECTS_DIR = join(homedir(), ".claude/projects");
+const PROGRESS_DISABLED = process.env.FCB_PROGRESS_DISABLED === "1";
 const LARK_CLI = process.env.FCB_LARK_CLI ?? "lark-cli";
 const CLAUDE_CLI = process.env.FCB_CLAUDE_CLI ?? "claude";
 // 默认 opus alias（Claude Code 会解析到 ANTHROPIC_DEFAULT_OPUS_MODEL 配置的实际 id）
@@ -326,9 +340,58 @@ function sendOneToFeishu(chatId: string, text: string): Promise<void> {
   });
 }
 
-// ─── per-chat claude run queue ───────────────────────────────────────────────
-// 同一 chat_id 快速发两条消息时，Claude Code 的 --resume session 不能并发写。
-// 方案：per-chat 串行化，第二条等第一条跑完再开始。
+// ─── progress helpers ────────────────────────────────────────────────────────
+// 流式进度消息（方案 A）：不做真·卡片 PATCH（lark-cli 不覆盖），而是把 Claude 的
+// tool_use 事件翻成轻量短消息推给飞书。用户看到 🔧 Read(...) / 🔧 Bash(...) 的
+// 串，知道 bridge 还活着、Claude 在干活。
+//
+// 阈值选择：tool_use 事件在长任务里通常每几秒一个；叠加 sendToFeishu 的 200ms
+// 节流已经够了，不再加业务层节流。文本流式（text_delta）本轮不做——Claude 最终
+// result 已经包含同一段文本，再流式会重复。
+
+// Claude 工具的"第一个有意义参数" —— 用来做 tool_use 预览
+const TOOL_ARG_PRIORITY = [
+  "file_path",
+  "path",
+  "command",
+  "pattern",
+  "query",
+  "url",
+  "description",
+  "prompt",
+  "content",
+];
+
+function truncateOneLine(s: string, n: number): string {
+  const compact = s.replace(/\s+/g, " ").trim();
+  return compact.length > n ? compact.slice(0, n - 1) + "…" : compact;
+}
+
+function formatToolCall(name: string, input: unknown): string {
+  if (!input || typeof input !== "object") return name;
+  const obj = input as Record<string, unknown>;
+  for (const key of TOOL_ARG_PRIORITY) {
+    if (typeof obj[key] === "string") {
+      return `${name}(${truncateOneLine(obj[key] as string, 60)})`;
+    }
+  }
+  // 兜底：第一个 string 值
+  for (const k of Object.keys(obj)) {
+    if (typeof obj[k] === "string") {
+      return `${name}(${truncateOneLine(obj[k] as string, 60)})`;
+    }
+  }
+  return name;
+}
+
+// ─── per-session claude run queue ────────────────────────────────────────────
+// 同一 session_id 不能并发 --resume（Claude Code 会报 "session ... already in use"）。
+// 所以按 session_id 串行；不同 session_id 并行 —— 这样 /new 之后旧 session 的
+// 长任务（如编译）继续在后台跑，不阻塞新 session 的新消息。
+//
+// 历史：原本按 chat_id 串行。用户 /new 后发新消息会被旧任务阻塞、且旧任务的
+// 输出继续往同一个 chat 推，两者都不符合预期。换成 per-session 后，旧任务
+// 输出由 sendForSession 识别为 "非 active" 并加前缀/静默进度。
 
 const claudeQueues = new Map<string, Promise<void>>();
 
@@ -338,12 +401,39 @@ function enqueueClaudeRun(
   prompt: string,
   opts: { isFreshSession: boolean }
 ) {
-  const prev = claudeQueues.get(chatId) ?? Promise.resolve();
+  const prev = claudeQueues.get(sessionId) ?? Promise.resolve();
   const next = prev.then(() => runClaude(sessionId, chatId, prompt, opts));
-  claudeQueues.set(chatId, next);
+  claudeQueues.set(sessionId, next);
   next.finally(() => {
-    if (claudeQueues.get(chatId) === next) claudeQueues.delete(chatId);
+    if (claudeQueues.get(sessionId) === next) claudeQueues.delete(sessionId);
   });
+}
+
+// 判断某 session 是否仍是该 chat 的 "当前 active"。
+// /new 会 delete sessions[chatId]；/resume 会指向另一个 sessionId；/model 切换会 reset。
+// 三种情况下，原 session 的后台 claude 进程对 chat 来说就是 "旧" session 了。
+function isActiveSession(chatId: string, sessionId: string): boolean {
+  return sessions[chatId] === sessionId;
+}
+
+function staleSessionPrefix(sessionId: string): string {
+  return `[📜 旧会话 ${sessionId.slice(0, 8)}] `;
+}
+
+// runClaude 往飞书发消息的统一入口：
+//   - active session：原样发
+//   - stale session (用户已 /new 切走)：
+//       kind="progress" → 完全静默（🔧 tool_use / ⏳ heartbeat 不打扰新会话）
+//       kind="result"   → 加 [📜 旧会话 xxx] 前缀，让用户能区分
+function sendForSession(
+  chatId: string,
+  sessionId: string,
+  text: string,
+  kind: "progress" | "result"
+) {
+  const active = isActiveSession(chatId, sessionId);
+  if (!active && kind === "progress") return;
+  sendToFeishu(chatId, active ? text : staleSessionPrefix(sessionId) + text);
 }
 
 function runClaude(
@@ -387,7 +477,7 @@ function runClaude(
       markSessionStarted(chatId);
     } catch (err) {
       console.error(`[fcb] claude spawn threw (binary missing?):`, err);
-      sendToFeishu(chatId, `❌ 无法启动 Claude Code: ${(err as Error).message}`);
+      sendForSession(chatId, sessionId, `❌ 无法启动 Claude Code: ${(err as Error).message}`, "result");
       resolve();
       return;
     }
@@ -398,9 +488,28 @@ function runClaude(
     let errorDetails = ""; // 组装好的错误信息（给飞书回发用）
     let stderrTail = "";
 
+    // 进度信号追踪：长时间没有任何 tool_use 时发一次心跳，避免用户以为 bridge 死了
+    let progressSent = false;
+    const HEARTBEAT_MS = 15_000;
+    const heartbeat = PROGRESS_DISABLED
+      ? null
+      : setTimeout(() => {
+          if (!progressSent) {
+            sendForSession(chatId, sessionId, "⏳ Claude 还在想，稍等...", "progress");
+            progressSent = true;
+          }
+        }, HEARTBEAT_MS);
+
+    function emitProgress(text: string) {
+      if (PROGRESS_DISABLED) return;
+      sendForSession(chatId, sessionId, text, "progress");
+      progressSent = true;
+    }
+
     if (!claude.stdout || !claude.stderr) {
       console.error("[fcb] claude spawn missing stdio");
-      sendToFeishu(chatId, "❌ Claude Code 进程 stdio 异常");
+      sendForSession(chatId, sessionId, "❌ Claude Code 进程 stdio 异常", "result");
+      if (heartbeat) clearTimeout(heartbeat);
       resolve();
       return;
     }
@@ -410,6 +519,25 @@ function runClaude(
       if (!line) return;
       try {
         const msg = JSON.parse(line) as StreamJsonMessage;
+        // 流式进度：Claude 每完成一个 content_block 会发 type=assistant 带那一块的完整
+        // content 数组。tool_use 块里 input 此时已经拼完整（避免 input_json_delta 增量
+        // 拼装的麻烦）。thinking / text 块忽略 —— 最终 result 里会带完整文本，流式
+        // 这些会和 result 重复。
+        if (msg.type === "assistant" && !PROGRESS_DISABLED) {
+          const content = (msg as { message?: { content?: unknown } }).message?.content;
+          if (Array.isArray(content)) {
+            for (const block of content) {
+              if (
+                block &&
+                typeof block === "object" &&
+                (block as { type?: string }).type === "tool_use"
+              ) {
+                const b = block as { name?: string; input?: unknown };
+                emitProgress(`🔧 ${formatToolCall(b.name ?? "?", b.input)}`);
+              }
+            }
+          }
+        }
         if (msg.type === "result") {
           sawResult = true;
           // result message 除了 "result" 字段，还有 is_error / subtype / errors 等诊断字段
@@ -457,38 +585,43 @@ function runClaude(
     });
 
     claude.on("exit", (code) => {
+      if (heartbeat) clearTimeout(heartbeat);
       console.log(
         `[fcb] claude exited chat=${chatId} code=${code} sawResult=${sawResult} isError=${resultIsError}`
       );
       // 优先级：happy path → result.is_error 细节 → stderr 兜底 → 裸退出码
       if (code === 0 && finalText && !resultIsError) {
-        sendToFeishu(chatId, finalText);
+        sendForSession(chatId, sessionId, finalText, "result");
       } else if (resultIsError && errorDetails) {
-        sendToFeishu(chatId, `❌ Claude Code 出错 (code=${code})\n${errorDetails}`);
+        sendForSession(chatId, sessionId, `❌ Claude Code 出错 (code=${code})\n${errorDetails}`, "result");
       } else if (code === 0 && !sawResult) {
-        sendToFeishu(chatId, "⚠️ Claude Code 正常退出但未产生 result 消息");
+        sendForSession(chatId, sessionId, "⚠️ Claude Code 正常退出但未产生 result 消息", "result");
       } else if (stderrTail) {
-        sendToFeishu(chatId, `❌ Claude Code 退出码 ${code}\nstderr: ${stderrTail.trim()}`);
+        sendForSession(chatId, sessionId, `❌ Claude Code 退出码 ${code}\nstderr: ${stderrTail.trim()}`, "result");
       } else {
-        sendToFeishu(chatId, `❌ Claude Code 退出码 ${code}`);
+        sendForSession(chatId, sessionId, `❌ Claude Code 退出码 ${code}`, "result");
       }
       resolve();
     });
 
     claude.on("error", (err) => {
+      if (heartbeat) clearTimeout(heartbeat);
       console.error(`[fcb] claude spawn error:`, err);
-      sendToFeishu(chatId, `❌ 无法启动 Claude Code: ${err.message}`);
+      sendForSession(chatId, sessionId, `❌ 无法启动 Claude Code: ${err.message}`, "result");
       resolve();
     });
   });
 }
 
 // Claude Code --output-format stream-json 的事件类型（按需扩展）
+// 注：assistant.message.content 是数组，每个元素可能是 {type:"text"|"thinking"|"tool_use",...}
+//     tool_use 块带 name + input（input 在 --include-partial-messages 下最终是完整的）
 type StreamJsonMessage =
   | { type: "system"; subtype: string; session_id?: string; [k: string]: unknown }
   | { type: "assistant"; message?: { content?: unknown }; [k: string]: unknown }
   | { type: "user"; [k: string]: unknown }
   | { type: "result"; result?: string; [k: string]: unknown }
+  | { type: "stream_event"; event?: { type?: string; [k: string]: unknown }; [k: string]: unknown }
   | { type: string; [k: string]: unknown };
 
 // ─── feishu event routing ────────────────────────────────────────────────────
@@ -523,15 +656,48 @@ type LarkEventEnvelope = {
   };
 };
 
-function extractText(message: NonNullable<LarkEventEnvelope["event"]>["message"]): string | null {
-  if (!message || message.message_type !== "text") return null;
-  if (!message.content) return null;
-  try {
-    const parsed = JSON.parse(message.content) as { text?: string };
-    return parsed.text?.trim() || null;
-  } catch {
-    return null;
+// 消息类型归一化：飞书事件的 message_type 多种（text/image/post/file/...），
+// 我们只处理 text / image 单图；其余落到 unsupported 分支给用户明确反馈。
+type IncomingMessage =
+  | { kind: "text"; text: string }
+  | { kind: "image"; messageId: string; imageKey: string }
+  | { kind: "unsupported"; reason: string };
+
+function extractMessage(
+  message: NonNullable<LarkEventEnvelope["event"]>["message"]
+): IncomingMessage {
+  if (!message) return { kind: "unsupported", reason: "no message" };
+  const mt = message.message_type;
+  if (!message.content) return { kind: "unsupported", reason: `empty content (${mt})` };
+
+  if (mt === "text") {
+    try {
+      const parsed = JSON.parse(message.content) as { text?: string };
+      const text = parsed.text?.trim() ?? "";
+      if (!text) return { kind: "unsupported", reason: "empty text" };
+      return { kind: "text", text };
+    } catch {
+      return { kind: "unsupported", reason: "bad text JSON" };
+    }
   }
+
+  if (mt === "image") {
+    try {
+      const parsed = JSON.parse(message.content) as { image_key?: string };
+      const imageKey = parsed.image_key;
+      const messageId = message.message_id;
+      if (!imageKey || !messageId) {
+        return { kind: "unsupported", reason: "image missing key/id" };
+      }
+      return { kind: "image", messageId, imageKey };
+    } catch {
+      return { kind: "unsupported", reason: "bad image JSON" };
+    }
+  }
+
+  // post/file/audio/video/share_chat 等：飞书 post 含图的场景 schema 复杂（elements
+  // 嵌套），暂不支持。用户要给图配文字就发两条。
+  return { kind: "unsupported", reason: `message_type=${mt}` };
 }
 
 function handleIncomingEvent(envelope: LarkEventEnvelope) {
@@ -550,21 +716,55 @@ function handleIncomingEvent(envelope: LarkEventEnvelope) {
     return;
   }
 
-  const text = extractText(inner?.message);
-  if (!text) {
-    sendToFeishu(chatId, "暂不支持该消息类型，只识别纯文本");
+  const msg = extractMessage(inner?.message);
+  console.log(
+    `[fcb] incoming chat=${chatId} sender=${senderId} kind=${msg.kind}` +
+      (msg.kind === "unsupported" ? ` reason=${msg.reason}` : "")
+  );
+
+  if (msg.kind === "unsupported") {
+    sendToFeishu(
+      chatId,
+      `暂不支持该消息类型（${msg.reason}）。支持：纯文本、单张图片。图+文字请分两条发。`
+    );
     return;
   }
 
+  if (msg.kind === "image") {
+    handleImageMessage(chatId, msg.messageId, msg.imageKey);
+    return;
+  }
+
+  const text = msg.text;
+
   // 元指令路由
   if (text === "/new" || text.startsWith("/new ")) {
+    const prevSid = sessions[chatId];
+    const hasBackgroundTask = prevSid != null && claudeQueues.has(prevSid);
     resetInteractiveSession(chatId);
-    sendToFeishu(chatId, "✅ 已重置会话，下一条消息开新 session");
+    if (hasBackgroundTask) {
+      sendToFeishu(
+        chatId,
+        `✅ 已开新会话，旧任务仍在后台继续跑（sid=${prevSid!.slice(0, 8)}），完成后会带 [📜 旧会话 ...] 前缀通知你；也可 /resume <编号> 切回去继续`
+      );
+    } else {
+      sendToFeishu(chatId, "✅ 已重置会话，下一条消息开新 session");
+    }
     return;
   }
 
   if (text === "/model" || text.startsWith("/model ")) {
     handleModelCommand(chatId, text.slice("/model".length).trim());
+    return;
+  }
+
+  if (text === "/usage" || text.startsWith("/usage ")) {
+    handleUsageCommand(chatId, text.slice("/usage".length).trim());
+    return;
+  }
+
+  if (text === "/resume" || text.startsWith("/resume ")) {
+    handleResumeCommand(chatId, text.slice("/resume".length).trim());
     return;
   }
 
@@ -617,6 +817,9 @@ function handleModelCommand(chatId: string, arg: string) {
   // 跨 model family 续传会触发 Anthropic API 的 "Invalid signature in thinking
   // block" 400（opus 的 extended thinking 历史 haiku 验证不过，反之亦然）。
   const modelChanged = prevModel !== nextModel;
+  const prevSidForModel = sessions[chatId];
+  const hadBackgroundTask =
+    modelChanged && prevSidForModel != null && claudeQueues.has(prevSidForModel);
   if (modelChanged) {
     resetInteractiveSession(chatId);
   }
@@ -626,7 +829,9 @@ function handleModelCommand(chatId: string, arg: string) {
       ? `（Claude Code 会解析为 ANTHROPIC_DEFAULT_${arg.toUpperCase()}_MODEL 配置的实际 id）`
       : "";
   const resetNote = modelChanged
-    ? "\n⚠️ 由于切换了模型，已重置对话上下文（下条消息开新 session）"
+    ? hadBackgroundTask
+      ? `\n⚠️ 由于切换了模型，已重置对话上下文；旧任务仍在后台跑（sid=${prevSidForModel!.slice(0, 8)}），完成后会带 [📜 旧会话 ...] 前缀通知你`
+      : "\n⚠️ 由于切换了模型，已重置对话上下文（下条消息开新 session）"
     : "";
 
   if (arg === "reset" || arg === "default") {
@@ -640,6 +845,412 @@ function handleModelCommand(chatId: string, arg: string) {
       `✅ 当前频道模型已切换到: ${arg}${hint}${resetNote}`
     );
   }
+}
+
+// ─── /usage：调 ccusage-report skill 脚本 ────────────────────────────────────
+// 为什么直调脚本而不走 claude：
+//   1. 快（~1s vs ~10s）
+//   2. 不花 token
+//   3. 崩了能直接定位到 bridge 日志，不是 Claude 思考链里
+// skill 脚本路径可用 FCB_CCUSAGE_SCRIPT 覆盖；脚本不存在时给清晰报错、不崩 bridge。
+
+function handleUsageCommand(chatId: string, daysArg: string) {
+  const days = /^\d+$/.test(daysArg) && Number(daysArg) > 0 ? daysArg : "7";
+  if (!existsSync(CCUSAGE_SCRIPT)) {
+    sendToFeishu(
+      chatId,
+      `❌ 未找到 ccusage-report 脚本:\n${CCUSAGE_SCRIPT}\n\n` +
+        `用 FCB_CCUSAGE_SCRIPT 环境变量指定路径，或安装 gstack/ccusage-report skill`
+    );
+    return;
+  }
+
+  let proc: ChildProcess;
+  try {
+    proc = spawn("bun", ["run", CCUSAGE_SCRIPT, days], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (err) {
+    sendToFeishu(chatId, `❌ 无法 spawn bun: ${(err as Error).message}`);
+    return;
+  }
+
+  let stdout = "";
+  let stderr = "";
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    proc.kill("SIGTERM");
+  }, 60_000);
+
+  proc.stdout?.on("data", (d) => (stdout += d.toString()));
+  proc.stderr?.on("data", (d) => (stderr += d.toString()));
+  proc.on("exit", (code) => {
+    clearTimeout(timer);
+    if (timedOut) {
+      sendToFeishu(chatId, "❌ ccusage-report 超时（60s）");
+      return;
+    }
+    if (code !== 0) {
+      sendToFeishu(
+        chatId,
+        `❌ ccusage-report 失败 (code=${code})\n` +
+          (stderr.trim().slice(-500) || "(no stderr)")
+      );
+      return;
+    }
+    sendToFeishu(chatId, stdout.trim() || "(空输出)");
+  });
+  proc.on("error", (err) => {
+    clearTimeout(timer);
+    sendToFeishu(chatId, `❌ spawn bun 失败: ${err.message}`);
+  });
+}
+
+// ─── 图片消息处理 ────────────────────────────────────────────────────────────
+// 飞书图片事件：message_type="image"，content JSON {"image_key": "img_xxx"}
+// 下载后拼 prompt "请分析这张图片：@<path>" 喂 claude；复用现有 per-chat session。
+// 清理：bridge 启动时扫 images/ 删 >24h 老目录（cleanupOldImages）。
+
+function handleImageMessage(chatId: string, messageId: string, imageKey: string) {
+  mkdirSync(IMAGES_DIR, { recursive: true });
+  const runDir = join(IMAGES_DIR, randomUUID());
+  mkdirSync(runDir, { recursive: true });
+
+  // 关键：lark-cli 的 --output 参数要求 **相对路径**（"relative only, no ..
+  // traversal"）。绝对路径会被拒绝。做法：把 spawn 的 cwd 设到 runDir，
+  // --output 只传裸文件名，lark-cli 会把文件放进 runDir 里。
+  // 文件名用 imageKey；实际扩展名由 lark-cli 按 Content-Type 推断再追加。
+  console.log(
+    `[fcb] image download start chat=${chatId} msg=${messageId} key=${imageKey} dir=${runDir}`
+  );
+
+  let proc: ChildProcess;
+  try {
+    proc = spawn(
+      LARK_CLI,
+      [
+        "im",
+        "+messages-resources-download",
+        "--as",
+        "bot",
+        "--message-id",
+        messageId,
+        "--file-key",
+        imageKey,
+        "--type",
+        "image",
+        "--output",
+        imageKey, // 裸文件名，相对 cwd=runDir
+      ],
+      { stdio: ["ignore", "pipe", "pipe"], cwd: runDir }
+    );
+  } catch (err) {
+    console.error("[fcb] image spawn threw:", err);
+    sendToFeishu(chatId, `❌ 无法 spawn lark-cli: ${(err as Error).message}`);
+    return;
+  }
+
+  let stdout = "";
+  let stderr = "";
+  proc.stdout?.on("data", (d) => (stdout += d.toString()));
+  proc.stderr?.on("data", (d) => (stderr += d.toString()));
+
+  proc.on("exit", (code) => {
+    const err = stderr.trim();
+    console.log(
+      `[fcb] image download exit chat=${chatId} code=${code} stderr_len=${err.length}`
+    );
+    if (code !== 0) {
+      // 尝试识别常见权限错误，给有行动性的提示
+      const lower = (err + " " + stdout).toLowerCase();
+      let hint = "";
+      if (
+        lower.includes("im:resource") ||
+        lower.includes("permission") ||
+        lower.includes("scope") ||
+        lower.includes("99991672") || // Feishu permission error code
+        lower.includes("no permission")
+      ) {
+        hint =
+          "\n\n💡 可能是飞书应用缺 `im:resource` 权限。去开放平台 →\n" +
+          "应用后台 → 权限管理 → 申请开通 `im:resource`，发版后重启 bridge。";
+      }
+      sendToFeishu(
+        chatId,
+        `❌ 图片下载失败 (code=${code})\n${err.slice(-400) || "(no stderr)"}${hint}`
+      );
+      return;
+    }
+    let files: string[] = [];
+    try {
+      files = readdirSync(runDir).filter((n) => !n.startsWith("."));
+    } catch (err) {
+      sendToFeishu(chatId, `❌ 读图片目录失败: ${(err as Error).message}`);
+      return;
+    }
+    console.log(`[fcb] image download ok files=${files.join(",")}`);
+    if (files.length === 0) {
+      sendToFeishu(
+        chatId,
+        "❌ 图片下载完成但目录为空（检查 ~/.local/state/fcb/images/ 是否 writable）"
+      );
+      return;
+    }
+    const absPath = join(runDir, files[0]);
+    const { id: sessionId, started } = getOrCreateInteractiveSession(chatId);
+    enqueueClaudeRun(chatId, sessionId, `请分析这张图片：@${absPath}`, {
+      isFreshSession: !started,
+    });
+  });
+
+  proc.on("error", (err) => {
+    console.error(`[fcb] image spawn error:`, err);
+    sendToFeishu(chatId, `❌ spawn lark-cli 失败: ${err.message}`);
+  });
+}
+
+function cleanupOldImages() {
+  if (!existsSync(IMAGES_DIR)) return;
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  let cleaned = 0;
+  try {
+    for (const name of readdirSync(IMAGES_DIR)) {
+      const p = join(IMAGES_DIR, name);
+      try {
+        const st = statSync(p);
+        if (st.mtimeMs < cutoff) {
+          rmSync(p, { recursive: true, force: true });
+          cleaned++;
+        }
+      } catch {
+        /* 单个目录失败忽略 */
+      }
+    }
+  } catch (err) {
+    console.error("[fcb] cleanupOldImages failed:", err);
+  }
+  if (cleaned > 0) console.log(`[fcb] cleaned ${cleaned} stale image dirs`);
+}
+
+// ─── /resume：跨设备 session handover ────────────────────────────────────────
+// 扫 ~/.claude/projects/<cwd-slug>/<uuid>.jsonl，按 mtime 倒序取最近 N 个；
+// 每个文件读首条 user 消息做 80 字预览。/resume 列表，/resume <N> 续接。
+// 复用现有 sessions.json（chatId -> session_id），不改 schema。
+
+type SessionInfo = {
+  sessionId: string;
+  cwdSlug: string;
+  preview: string;
+  mtime: number;
+};
+
+// 系统注入的 meta 前缀 —— 不是用户的真实 prompt，跳过
+const SYSTEM_CONTENT_PREFIXES = [
+  "<local-command-caveat>",
+  "<local-command-stdout>",
+  "<command-name>",
+  "<command-message>",
+  "<command-args>",
+];
+
+function isSystemMetaContent(content: string): boolean {
+  const trimmed = content.trim();
+  return SYSTEM_CONTENT_PREFIXES.some((p) => trimmed.startsWith(p));
+}
+
+function extractFirstUserMessage(filePath: string): string {
+  // Claude Code 的 JSONL 里第一条 user 消息格式有几种：
+  //   - {type:"user", message:{role:"user", content:"..."|[...]}}
+  //   - {type:"queue-operation", operation:"enqueue", content:"..."}（某些版本）
+  //   - {type:"ai-title", aiTitle:"..."}（Claude 自动生成的标题，最佳来源）
+  // 只扫前 200 行（开头 meta/系统消息可能很多），免得读大文件
+  let aiTitle = "";
+  try {
+    const raw = readFileSync(filePath, "utf-8");
+    const lines = raw.split("\n").slice(0, 200);
+    for (const line of lines) {
+      if (!line) continue;
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown>;
+        // 最佳来源：Claude 自动生成的标题
+        if (obj.type === "ai-title" && typeof obj.aiTitle === "string" && obj.aiTitle) {
+          aiTitle = obj.aiTitle.trim();
+        }
+        if (
+          obj.type === "queue-operation" &&
+          obj.operation === "enqueue" &&
+          typeof obj.content === "string"
+        ) {
+          const trimmed = obj.content.trim();
+          if (!isSystemMetaContent(trimmed)) {
+            return trimmed.replace(/\s+/g, " ").slice(0, 80);
+          }
+        }
+        if (obj.type === "user") {
+          // 跳过 isMeta 消息（系统注入的 local-command-caveat 等）
+          if (obj.isMeta) continue;
+          const message = obj.message as
+            | { role?: string; content?: unknown }
+            | undefined;
+          if (message?.role !== "user") continue;
+          const content = message.content;
+          if (typeof content === "string") {
+            const trimmed = content.trim();
+            // 跳过系统命令类消息（/model、local-command 等）
+            if (isSystemMetaContent(trimmed)) continue;
+            if (trimmed.startsWith("<command-")) continue;
+            return trimmed.replace(/\s+/g, " ").slice(0, 80);
+          }
+          if (Array.isArray(content)) {
+            // 跳过 tool_result，找 text 块
+            for (const c of content) {
+              if (
+                c &&
+                typeof c === "object" &&
+                (c as { type?: string }).type === "text" &&
+                typeof (c as { text?: string }).text === "string"
+              ) {
+                const text = (c as { text: string }).text.trim();
+                if (isSystemMetaContent(text)) continue;
+                return text.replace(/\s+/g, " ").slice(0, 80);
+              }
+            }
+          }
+        }
+      } catch {
+        /* 忽略非 JSON 行 */
+      }
+    }
+  } catch {
+    /* 读不了返回空 */
+  }
+  // 兜底：用 Claude 自动生成的标题（如果有）
+  return aiTitle || "(无 user 消息)";
+}
+
+function listRecentSessions(limit: number): SessionInfo[] {
+  if (!existsSync(CLAUDE_PROJECTS_DIR)) return [];
+  const results: SessionInfo[] = [];
+  let projectNames: string[];
+  try {
+    projectNames = readdirSync(CLAUDE_PROJECTS_DIR);
+  } catch (err) {
+    console.error("[fcb] listRecentSessions readdir failed:", err);
+    return [];
+  }
+
+  for (const projectName of projectNames) {
+    const projectPath = join(CLAUDE_PROJECTS_DIR, projectName);
+    let isDir = false;
+    try {
+      isDir = statSync(projectPath).isDirectory();
+    } catch {
+      continue;
+    }
+    if (!isDir) continue;
+
+    let files: string[];
+    try {
+      files = readdirSync(projectPath);
+    } catch {
+      continue;
+    }
+
+    for (const fname of files) {
+      if (!fname.endsWith(".jsonl")) continue;
+      const filePath = join(projectPath, fname);
+      let mtime: number;
+      try {
+        mtime = statSync(filePath).mtimeMs;
+      } catch {
+        continue;
+      }
+      const sessionId = fname.replace(/\.jsonl$/, "");
+      // 简化：UUID 长度校验（避免把非 session 文件纳入）
+      if (!/^[0-9a-f-]{30,}$/i.test(sessionId)) continue;
+      results.push({
+        sessionId,
+        cwdSlug: projectName,
+        preview: extractFirstUserMessage(filePath),
+        mtime,
+      });
+    }
+  }
+
+  return results.sort((a, b) => b.mtime - a.mtime).slice(0, limit);
+}
+
+function formatSlugAsProjectName(slug: string): string {
+  // Claude Code 把 cwd 里的 / 编码成 -，所以 slug 是 -Users-ym-Projects-xxx
+  // 我们不做完美反解（micode-AI 这种名字里带 - 的会歧义），只显示末尾可识别部分
+  const m = slug.match(/-Projects-(.+)$/);
+  if (m) return m[1];
+  return slug.length > 40 ? "…" + slug.slice(-40) : slug;
+}
+
+function formatSessionTime(mtime: number): string {
+  const d = new Date(mtime);
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mn = String(d.getMinutes()).padStart(2, "0");
+  return `${mm}-${dd} ${hh}:${mn}`;
+}
+
+// 每个 chat 缓存最近一次 /resume 的列表，供 /resume <N> 按编号续接
+const resumeListCache = new Map<string, SessionInfo[]>();
+
+function handleResumeCommand(chatId: string, arg: string) {
+  if (!arg) {
+    const list = listRecentSessions(10);
+    if (list.length === 0) {
+      sendToFeishu(
+        chatId,
+        "📚 未找到任何 session（检查 ~/.claude/projects/ 或先在终端里跑一次 claude）"
+      );
+      return;
+    }
+    resumeListCache.set(chatId, list);
+    const lines = ["📚 **最近 session**（最新在上）：", ""];
+    list.forEach((s, i) => {
+      lines.push(
+        `**${i + 1}.** \`[${formatSessionTime(s.mtime)}]\` ${formatSlugAsProjectName(s.cwdSlug)}`
+      );
+      lines.push(`   ${s.preview}`);
+      lines.push("");
+    });
+    lines.push("回 `/resume <编号>` 续接；`/new` 重置开新会话");
+    sendToFeishu(chatId, lines.join("\n"));
+    return;
+  }
+
+  const idx = parseInt(arg, 10);
+  if (!Number.isFinite(idx) || idx < 1) {
+    sendToFeishu(chatId, "❌ 用法: /resume（列出）或 /resume <编号>");
+    return;
+  }
+  const cache = resumeListCache.get(chatId);
+  if (!cache || cache.length === 0) {
+    sendToFeishu(chatId, "❌ 请先发 /resume 获取列表，再用编号续接");
+    return;
+  }
+  if (idx > cache.length) {
+    sendToFeishu(chatId, `❌ 编号越界（最多 ${cache.length}）`);
+    return;
+  }
+  const target = cache[idx - 1];
+  // 关键：把 chat 的 session 指向历史 session_id，并标记 started（触发 --resume）
+  sessions[chatId] = target.sessionId;
+  startedSessions.add(chatId);
+  saveSessions();
+  sendToFeishu(
+    chatId,
+    `✅ 已接入 session \`${target.sessionId.slice(0, 8)}\` ` +
+      `(${formatSlugAsProjectName(target.cwdSlug)})\n` +
+      `   ${target.preview}\n\n` +
+      `下一条消息会在此 session 续接。注意 cwd 还是在 Claude Code 当时的目录。`
+  );
 }
 
 // ─── lark-cli event subscription daemon (with watchdog) ──────────────────────
@@ -764,7 +1375,9 @@ for (const sig of ["SIGINT", "SIGTERM"] as const) {
 
 // ─── go ──────────────────────────────────────────────────────────────────────
 
+cleanupOldImages();
+
 console.log(
-  `[fcb] bridge started | whitelist=${OWNER_OPEN_IDS.size} chats=${Object.keys(sessions).length} crons=${cronJobs.length} model=${CLAUDE_MODEL}`
+  `[fcb] bridge started | whitelist=${OWNER_OPEN_IDS.size} chats=${Object.keys(sessions).length} crons=${cronJobs.length} model=${CLAUDE_MODEL}${PROGRESS_DISABLED ? " progress=off" : ""}`
 );
 startLarkSubscribe();
