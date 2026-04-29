@@ -53,6 +53,33 @@ if (OWNER_OPEN_IDS.size === 0) {
 
 mkdirSync(STATE_DIR, { recursive: true });
 
+// 启动前做外部 CLI 存在性 + 可执行性检查，别等 spawn 才 ENOENT
+// 背景：VSCode Claude Code 插件升级时会清老版本目录，/opt/homebrew/bin/claude 的
+// symlink 经常烂掉。以前这种情况要等用户发消息、bridge spawn claude 失败才发现；
+// 现在启动就 fail fast + 清晰报错。
+import { spawnSync } from "node:child_process";
+
+function preflightCLI(cli: string, envVarName: string) {
+  const probe = spawnSync(cli, ["--version"], { stdio: "pipe" });
+  if (probe.error || probe.status !== 0) {
+    console.error(
+      `[fcb] FATAL: 外部 CLI "${cli}" 不可用（${envVarName} 环境变量可覆盖）`
+    );
+    if (probe.error) console.error(`[fcb]        error: ${probe.error.message}`);
+    if (probe.stderr?.length) console.error(`[fcb]        stderr: ${probe.stderr.toString().trim()}`);
+    console.error(
+      `[fcb] 常见原因：PATH 不含安装目录；或 symlink 指向已删除的 binary`
+    );
+    console.error(
+      `[fcb] 修法：确认 \`${cli} --version\` 在你的 shell 里能跑；或把 ${envVarName} 指到绝对路径`
+    );
+    process.exit(1);
+  }
+}
+
+preflightCLI(LARK_CLI, "FCB_LARK_CLI");
+preflightCLI(CLAUDE_CLI, "FCB_CLAUDE_CLI");
+
 // ─── persistence ────────────────────────────────────────────────────────────
 
 type Sessions = Record<string, string>; // chat_id -> session_id (交互式)
