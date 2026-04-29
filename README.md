@@ -2,7 +2,9 @@
 
 > Co-author：Claude Opus 4.7
 
-把 **飞书** 变成 **Claude Code CLI** 的远程对讲机。人在外面、机器在家里：飞书 @bot 发消息 → 家里的 Mac 跑 Claude Code → 结果推回飞书。
+把 **飞书** 变成 **Claude Code CLI** 的远程对讲机。
+
+人在外面、机器在家里：飞书 @bot 发消息 → 家里的 Mac 跑 Claude Code → 结果推回飞书。
 
 **能干什么**：
 
@@ -410,6 +412,34 @@ bun run bridge.ts
 ```
 
 自测必做：每次改完或重启前 `claude --version` / `lark-cli --version` 各跑一次，验证外部 CLI 活着；bridge 启动日志里 `whitelist=N` 的 N 应等于 `FCB_OWNER_OPEN_IDS` 逗号分隔的个数。
+
+**部署完后，把这段交付信息 ctrl-C-ctrl-V 回给用户**（让他知道装完了 + 日常怎么用，别让他再去翻 README）：
+
+````markdown
+✅ feishu-claude-bridge 装好了。bridge 已在 tmux session `fcb` 里跑着，现在可以飞书 @bot 试了。
+
+**以后日常只需要这 5 个命令**（已装进你的 `~/.zshrc`，先 `source ~/.zshrc` 或开新终端生效）：
+
+```
+fcb-start     # 起 bridge
+fcb-log       # 实时看 log
+fcb-attach    # 进 tmux 交互（Ctrl-b 再按 d 脱离，不杀 bridge）
+fcb-restart   # 改了代码后重启
+fcb-stop      # 停 bridge
+```
+
+**飞书里的元指令**：
+- `/new` 重置当前频道的对话上下文
+- `/model haiku` / `sonnet` / `opus` 切换模型（当前频道）
+- `/model` 查看当前频道用的模型
+
+**注意**：
+- Mac 重启后 tmux session 会丢，需要重新 `fcb-start`。想登录自启看 README 进阶 B 节（LaunchAgent）。
+- 定时任务（"每天 9 点扫日志"）：改 `~/.local/state/fcb/crontab.json` 然后 `fcb-restart`，见 README 进阶 C。
+- 安全底线：飞书账号开 2FA。账号被盗 = 你这台 Mac 被盗。
+````
+
+如果 agent 没给用户装 alias（用户没确认、或者非 zsh 环境），把 alias 块和 README 进阶 A 的链接也一并发回给用户让他自己装。
 
 ---
 
